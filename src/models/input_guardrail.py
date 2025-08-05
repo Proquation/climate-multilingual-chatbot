@@ -3,6 +3,7 @@ import logging
 import time
 from pathlib import Path
 import torch
+import numpy as np
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -16,6 +17,8 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import boto3
 from botocore.config import Config
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Import Azure configuration
 from src.data.config.azure_config import is_running_in_azure
@@ -30,6 +33,88 @@ logger = logging.getLogger(__name__)
 def construct_dataset(question):
     """Return a dataset from a question"""
     return Dataset.from_dict({'question': [question]})
+
+def calculate_semantic_similarity(query: str, reference_texts: List[str], similarity_model) -> float:
+    """
+    Calculate semantic similarity between query and reference texts using sentence transformers.
+    
+    Args:
+        query (str): The user query to evaluate
+        reference_texts (List[str]): List of climate-related reference texts
+        similarity_model: Pre-loaded SentenceTransformer model
+        
+    Returns:
+        float: Maximum cosine similarity score (0-1)
+    """
+    try:
+        # Encode the query and reference texts
+        query_embedding = similarity_model.encode([query], convert_to_tensor=False)
+        reference_embeddings = similarity_model.encode(reference_texts, convert_to_tensor=False)
+        
+        # Calculate cosine similarities between query and all reference texts
+        similarities = cosine_similarity(query_embedding, reference_embeddings)[0]
+        
+        # Return the maximum similarity score
+        max_similarity = float(np.max(similarities))
+        
+        logger.info(f"Semantic similarity scores: max={max_similarity:.3f}, mean={np.mean(similarities):.3f}")
+        
+        return max_similarity
+        
+    except Exception as e:
+        logger.error(f"Error calculating semantic similarity: {str(e)}")
+        return 0.0
+
+def get_climate_reference_texts() -> List[str]:
+    """
+    Return a comprehensive list of climate-related reference texts for semantic similarity.
+    These texts cover various climate topics and should capture semantic relationships.
+    """
+    return [
+        # Core climate concepts
+        "Climate change refers to long-term shifts in temperatures and weather patterns",
+        "Global warming is the increase in Earth's average surface temperature",
+        "Greenhouse gases trap heat in the atmosphere causing temperature rise",
+        "Carbon dioxide emissions from fossil fuels contribute to climate change",
+        "Ocean acidification occurs when seawater absorbs carbon dioxide",
+        
+        # Environmental processes and systems
+        "Rivers and watersheds are affected by changing precipitation patterns",
+        "Ocean currents distribute heat around the planet",
+        "pH levels in oceans are decreasing due to carbon absorption",
+        "Coral reefs are bleaching due to rising water temperatures",
+        "Arctic ice is melting at accelerating rates",
+        "Sea level rise threatens coastal communities worldwide",
+        
+        # Ecological impacts
+        "Ecosystems are shifting due to changing climate conditions",
+        "Species migration patterns are changing with temperature",
+        "Forest fires are becoming more frequent and intense",
+        "Biodiversity loss is accelerated by climate impacts",
+        "Agricultural yields are affected by weather changes",
+        "Water resources are stressed by drought and flooding",
+        
+        # Scientific measurements and indicators
+        "Temperature records show warming trends over decades",
+        "Ice core data reveals historical climate patterns",
+        "Atmospheric CO2 concentrations have reached record levels",
+        "Weather stations monitor changing precipitation patterns",
+        "Satellite data tracks ice sheet thickness changes",
+        "Ocean temperature measurements show warming trends",
+        
+        # Solutions and mitigation
+        "Renewable energy reduces greenhouse gas emissions",
+        "Carbon capture technology removes CO2 from atmosphere",
+        "Energy efficiency reduces fossil fuel consumption",
+        "Sustainable agriculture adapts to climate impacts",
+        "Conservation efforts protect climate-vulnerable species",
+        "Climate adaptation helps communities prepare for changes",
+        
+        # Multi-language examples
+        "气候变化影响全球生态系统和人类社会",  # Chinese: Climate change affects global ecosystems and human society
+        "El cambio climático afecta los océanos y ríos",  # Spanish: Climate change affects oceans and rivers
+        "Le changement climatique modifie l'acidité des océans",  # French: Climate change modifies ocean acidity
+    ]
 
 async def check_follow_up_with_llm(query: str, conversation_history: List[Dict] = None, nova_model=None) -> Dict[str, Any]:
     """
@@ -141,22 +226,25 @@ async def topic_moderation(
     query: str, 
     moderation_pipe=None,
     conversation_history: List[Dict] = None,
-    nova_model=None
+    nova_model=None,
+    similarity_model=None
 ) -> Dict[str, Any]:
     """
     Validate if query is about climate change or is a follow-up question.
+    Now uses semantic similarity for more flexible topic detection.
     
     Args:
         query (str): The user query
         moderation_pipe: Optional pre-initialized pipeline
         conversation_history (List[Dict], optional): Previous conversation turns
         nova_model: Optional Nova model for LLM operations
+        similarity_model: Optional SentenceTransformer model for semantic similarity
         
     Returns:
         Dict[str, Any]: Result of moderation with passed flag
     """
     try:
-        # Lists of climate-related keywords in multiple languages
+        # Lists of climate-related keywords in multiple languages (still used for explicit matches)
         climate_keywords = [
             # English
             'climate', 'weather', 'warming', 'carbon', 'emission', 'greenhouse', 
@@ -164,25 +252,30 @@ async def topic_moderation(
             'renewable', 'arctic', 'icecap', 'glacier', 'environment', 
             'pollution', 'fossil fuel', 'solar', 'wind power', 'deforestation',
             'biodiversity', 'ecosystem', 'conservation', 'adaptation', 'resilience',
-            'methane', 'co2', 'atmosphere',
+            'methane', 'co2', 'atmosphere', 'ph', 'river', 'rivers', 'water',
+            'precipitation', 'drought', 'flood', 'coral', 'reef', 'species',
+            'forest', 'agriculture', 'farming', 'ice', 'snow', 'precipitation',
             
             # Chinese
             '气候', '天气', '变暖', '全球变暖', '碳', '排放', '温室',
             '温度', '海洋', '海平面', '能源', '可持续性', '再生能源',
             '北极', '冰盖', '冰川', '环境', '污染', '化石燃料',
             '太阳能', '风能', '森林砍伐', '生物多样性', '生态系统',
+            '河流', '水', '降水', '干旱', '洪水', '珊瑚', '物种',
             
             # Spanish
             'clima', 'tiempo', 'calentamiento', 'carbono', 'emisión', 'invernadero',
             'temperatura', 'océano', 'nivel del mar', 'energía', 'sostenibilidad',
             'renovable', 'ártico', 'casquete polar', 'glaciar', 'ambiente', 
             'contaminación', 'combustible fósil', 'solar', 'eólica',
+            'río', 'ríos', 'agua', 'precipitación', 'sequía', 'inundación',
             
             # French
             'climat', 'météo', 'réchauffement', 'carbone', 'émission', 'serre',
             'température', 'océan', 'niveau de la mer', 'énergie', 'durabilité',
             'renouvelable', 'arctique', 'calotte glaciaire', 'glacier', 'environnement',
-            'pollution', 'combustible fossile', 'solaire', 'éolienne'
+            'pollution', 'combustible fossile', 'solaire', 'éolienne',
+            'rivière', 'rivières', 'eau', 'précipitation', 'sécheresse', 'inondation'
         ]
         
         # List of off-topic keywords that should always be rejected
@@ -224,7 +317,28 @@ async def topic_moderation(
             logger.info("Query contains explicit climate keywords - allowing")
             return {"passed": True, "reason": "climate_keywords", "score": 0.95}
         
-        # Last check: If not obvious, use the ML model if available
+        # Fourth check: Use semantic similarity if available (NEW - more flexible approach)
+        if similarity_model:
+            try:
+                logger.info("Running semantic similarity analysis...")
+                reference_texts = get_climate_reference_texts()
+                similarity_score = calculate_semantic_similarity(query, reference_texts, similarity_model)
+                
+                # More lenient threshold than previous ML model (0.4 vs 0.6)
+                # This allows queries like "pH" or "rivers" to pass through
+                similarity_threshold = 0.4
+                
+                if similarity_score >= similarity_threshold:
+                    logger.info(f"Query passed semantic similarity check: {similarity_score:.3f} >= {similarity_threshold}")
+                    return {"passed": True, "reason": "semantic_similarity", "score": similarity_score}
+                else:
+                    logger.info(f"Query failed semantic similarity check: {similarity_score:.3f} < {similarity_threshold}")
+                    # Don't immediately reject - still try the ClimateBERT model below
+                    
+            except Exception as e:
+                logger.error(f"Error in semantic similarity analysis: {str(e)}")
+        
+        # Fifth check: Use ClimateBERT ML model as backup if semantic similarity not available or failed
         if moderation_pipe:
             try:
                 # Run classification
@@ -259,9 +373,9 @@ async def topic_moderation(
         # Default to passing in case of errors
         return {"passed": True, "reason": "error_in_moderation", "error": str(e), "score": 0.5}
 
-async def safe_guard_input(question: str, pipe) -> Dict[str, Any]:
+async def safe_guard_input(question: str, pipe, similarity_model=None) -> Dict[str, Any]:
     """Execute topic moderation in a safe way with retries."""
-    return await topic_moderation(question, pipe)
+    return await topic_moderation(question, pipe, similarity_model=similarity_model)
 
 def check_dir(path, description="directory"):
     """Utility function to check directory existence and list contents"""
@@ -385,8 +499,26 @@ def initialize_models():
             device=device
         )
         
+        # Initialize sentence transformer model for semantic similarity
+        # Using a multilingual model that works well across languages
+        logger.info("Initializing sentence transformer model for semantic similarity...")
+        try:
+            # Use a compact but effective multilingual model
+            similarity_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+            logger.info("✓ Successfully initialized semantic similarity model")
+        except Exception as sim_err:
+            logger.warning(f"Failed to initialize similarity model: {str(sim_err)}")
+            logger.info("Falling back to basic multilingual model...")
+            try:
+                # Fallback to an even smaller model
+                similarity_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+                logger.info("✓ Successfully initialized fallback similarity model")
+            except Exception as fallback_err:
+                logger.error(f"Failed to initialize any similarity model: {str(fallback_err)}")
+                similarity_model = None
+        
         logger.info("Models initialized successfully")
-        return topic_moderation_pipe, None
+        return topic_moderation_pipe, similarity_model
         
     except Exception as e:
         logger.error(f"Error initializing models: {e}")
@@ -397,7 +529,7 @@ if __name__ == "__main__":
     import asyncio
     
     async def test_moderation():
-        topic_moderation_pipe, _ = initialize_models()
+        topic_moderation_pipe, similarity_model = initialize_models()
         
         test_questions = [
             "what is climate change?",
@@ -408,12 +540,20 @@ if __name__ == "__main__":
             'where can I buy new shoes?',
             'what else can i do to help?',
             'tell me more about CO2 emissions',
+            # NEW TEST CASES for semantic similarity
+            'What is the pH of ocean water?',
+            'How do rivers affect the environment?',
+            'Tell me about coral reefs',
+            'What happens to ice when it melts?',
+            'How does agriculture relate to weather?',
+            'What are the effects on marine species?',
+            'Can you explain precipitation patterns?',
         ]
         
         # Test each question independently
         for question in test_questions:
             print(f"\nTesting standalone: {question}")
-            topic_result = await topic_moderation(question, topic_moderation_pipe)
+            topic_result = await topic_moderation(question, topic_moderation_pipe, similarity_model=similarity_model)
             print(f"Topic moderation result: {topic_result}")
             
         # Now test with conversation history
@@ -427,10 +567,10 @@ if __name__ == "__main__":
         
         follow_up = "what else should I know?"
         print(f"\nFollow-up with context: {follow_up}")
-        result = await topic_moderation(follow_up, topic_moderation_pipe, conversation_history)
+        result = await topic_moderation(follow_up, topic_moderation_pipe, conversation_history, similarity_model=similarity_model)
         print(f"Result with history: {result}")
         
-        result_no_context = await topic_moderation(follow_up, topic_moderation_pipe)
+        result_no_context = await topic_moderation(follow_up, topic_moderation_pipe, similarity_model=similarity_model)
         print(f"Result without history: {result_no_context}")
         
         print('-'*50)

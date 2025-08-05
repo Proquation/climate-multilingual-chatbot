@@ -305,6 +305,24 @@ class MultilingualClimateChatbot:
                 max_length=512
             )
             logger.info("✓ Topic moderation pipeline initialized successfully")
+            
+            # Initialize sentence transformer model for semantic similarity
+            logger.info("Initializing sentence transformer model for semantic similarity...")
+            try:
+                from sentence_transformers import SentenceTransformer
+                # Use a compact but effective multilingual model
+                self.similarity_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+                logger.info("✓ Successfully initialized semantic similarity model")
+            except Exception as sim_err:
+                logger.warning(f"Failed to initialize similarity model: {str(sim_err)}")
+                logger.info("Falling back to basic multilingual model...")
+                try:
+                    # Fallback to an even smaller model
+                    self.similarity_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+                    logger.info("✓ Successfully initialized fallback similarity model")
+                except Exception as fallback_err:
+                    logger.error(f"Failed to initialize any similarity model: {str(fallback_err)}")
+                    self.similarity_model = None
         except Exception as e:
             logger.error(f"Error initializing models: {str(e)}")
             raise ValueError(f"Failed to initialize ClimateBERT model: {str(e)}")
@@ -449,8 +467,8 @@ class MultilingualClimateChatbot:
                 
            
             try:
-                # Direct topic moderation call 
-                topic_results = await topic_moderation(query, self.topic_moderation_pipe)
+                # Direct topic moderation call with similarity model
+                topic_results = await topic_moderation(query, self.topic_moderation_pipe, similarity_model=getattr(self, 'similarity_model', None))
                 
                 if not topic_results or not topic_results.get('passed', False):
                     result_reason = topic_results.get('reason', 'not_climate_related')
@@ -602,12 +620,13 @@ class MultilingualClimateChatbot:
                     
                     # Topic moderation check using English query - now passing the nova_model for LLM-based detection
                     validation_start = time.time()
-                    # Pass conversation history to topic_moderation along with nova_model
+                    # Pass conversation history to topic_moderation along with nova_model and similarity_model
                     topic_results = await topic_moderation(
                         query=english_query, 
                         moderation_pipe=self.topic_moderation_pipe,
                         conversation_history=conversation_history,
-                        nova_model=self.nova_model  # Pass the Nova model for LLM follow-up detection
+                        nova_model=self.nova_model,  # Pass the Nova model for LLM follow-up detection
+                        similarity_model=getattr(self, 'similarity_model', None)  # Pass the similarity model
                     )
                     step_times['validation'] = time.time() - validation_start
                     
