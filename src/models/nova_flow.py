@@ -227,18 +227,35 @@ Answer with ONLY the classification result, no explanations or additional text."
             if not text or source_lang == target_lang:
                 return text
 
+            # Preprocess text to help with translation quality
+            processed_text = text.strip()
+            
+            # If it looks like a question but doesn't have proper punctuation, add it
+            question_words = ['what', 'how', 'why', 'when', 'where', 'who', 'which', 'can', 'do', 'does', 'is', 'are']
+            if (processed_text.lower().split()[0] in question_words and 
+                not processed_text.endswith('?') and 
+                not processed_text.endswith('.')):
+                processed_text += '?'
+            
+            # Capitalize first letter if it's not already
+            if processed_text and not processed_text[0].isupper():
+                processed_text = processed_text[0].upper() + processed_text[1:]
+
+            # Simple and clear prompt
+            prompt = f"Translate from {source_lang} to {target_lang}: {processed_text}"
+
             payload = {
                 "messages": [
                     {
                         "role": "user",
                         "content": [
-                            {"text": f"Provide ONLY a direct translation of {text} from {source_lang} to {target_lang}"}
+                            {"text": prompt}
                         ]
                     }
                 ],
                 "inferenceConfig": {
                     "maxTokens": 10000,
-                    "temperature": 0.1
+                    "temperature": 0.2  # Slightly higher for better natural language handling
                 }
             }
 
