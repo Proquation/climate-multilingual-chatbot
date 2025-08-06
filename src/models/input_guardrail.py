@@ -134,38 +134,57 @@ async def check_follow_up_with_llm(query: str, conversation_history: List[Dict] 
         return {"is_follow_up": False, "confidence": 1.0, "reason": "no_conversation_history"}
     
     try:
-        # Get the last conversation turn
-        last_turn = conversation_history[-1]
-        prev_query = last_turn.get('query', '')
-        prev_response = last_turn.get('response', '')
+        # Build comprehensive conversation context
+        # Include up to 3 most recent turns for context (without overwhelming the prompt)
+        context_window = conversation_history[-min(3, len(conversation_history)):]
+        context_lines = []
         
-        # Create a broader context summary if conversation is longer than 1 turn
-        conversation_context = ""
-        if len(conversation_history) > 1:
-            # Include up to 3 previous turns for context (without overwhelming the prompt)
-            context_window = conversation_history[-min(3, len(conversation_history)):]
-            context_summary = []
+        for i, turn in enumerate(context_window):
+            turn_query = turn.get('query', '').strip()
+            turn_response = turn.get('response', '').strip()
             
-            for turn in context_window:
-                context_summary.append(f"Q: {turn.get('query', '')}")
-                context_summary.append(f"A: {turn.get('response', '')}")
+            if turn_query:
+                context_lines.append(f"User: {turn_query}")
+            if turn_response:
+                # Truncate very long responses to avoid overwhelming the prompt
+                if len(turn_response) > 200:
+                    turn_response = turn_response[:200] + "..."
+                context_lines.append(f"Assistant: {turn_response}")
             
-            conversation_context = "Previous conversation turns:\n" + "\n".join(context_summary)
+            # Add separator between turns (except for the last one)
+            if i < len(context_window) - 1:
+                context_lines.append("---")
         
-        # Create a prompt to ask the LLM if the current query is a follow-up to the conversation
-        # This works across all languages without requiring hardcoded phrases
-        system_message = "You are an AI assistant helping determine if a message is a follow-up question to a previous conversation or if it represents a new topic. Consider the context carefully."
+        conversation_context = "\n".join(context_lines)
         
-        prompt = f"""Most recent question: {prev_query}
-Most recent response: {prev_response}
+        # Create a clearer prompt for follow-up detection
+        system_message = """You are an expert at determining whether a user message is a follow-up question to an ongoing conversation. 
+
+A follow-up question:
+- Refers to something mentioned in the previous conversation
+- Asks for clarification, elaboration, or more details about the current topic
+- Uses pronouns (it, this, that, they) referring to previous content
+- Builds upon or continues the established topic
+- Asks "why", "how", "what about", "tell me more" in relation to the current topic
+
+A new question:
+- Introduces a completely different topic
+- Is self-contained and doesn't reference previous content
+- Could be asked without any prior conversation context"""
+        
+        prompt = f"""Conversation history:
 {conversation_context}
 
-Current user message: {query}
+New user message: "{query}"
 
-Is the current user message a follow-up to the previous conversation on the SAME TOPIC? Answer with YES or NO and explain briefly.
-YES means it's related to or building upon the current topic of conversation.
-NO means it's a new independent question or topic shift.
-"""
+Based on the conversation history above, is this new message a FOLLOW-UP question to the ongoing conversation, or is it a NEW independent question on a different topic?
+
+Consider:
+- Does it reference something from the previous conversation?
+- Does it seek clarification or more details about what was already discussed?
+- Could it be understood without the conversation context?
+
+Answer with just YES (if it's a follow-up) or NO (if it's a new topic), followed by a brief explanation."""
         
         # Get the LLM's assessment
         try:
@@ -198,28 +217,82 @@ NO means it's a new independent question or topic shift.
         return _fallback_follow_up_check(query)
 
 def _fallback_follow_up_check(query: str) -> Dict[str, Any]:
-    """Fallback method using simple heuristics when LLM is unavailable."""
+    """Fallback method using improved heuristics when LLM is unavailable."""
+    
+    # Enhanced follow-up indicators
     follow_up_indicators = [
-        # English
+        # English - common follow-up patterns
+        'why', 'how', 'what about', 'what if', 'tell me about', 'tell me more',
+        'explain', 'elaborate', 'detail', 'clarify', 'expand',
         'else', 'more', 'another', 'additional', 'other', 'also', 'further', 
-        'too', 'as well', 'next', 'again', 'they', 'their', 'that', 'this', 
-        'those', 'these', 'it', 'them', 'explain', 'elaborate', 'detail',
-        'why', 'how', 'what about', 'what if', 'tell me about', 'and', 'but', 'so',
-
+        'too', 'as well', 'next', 'again', 'continue',
+        
+        # Pronouns and references
+        'they', 'their', 'that', 'this', 'those', 'these', 'it', 'them',
+        'which', 'such', 'same',
+        
+        # Question connectors
+        'and', 'but', 'so', 'then', 'because', 'since',
+        
+        # Importance/significance questions
+        'important', 'significance', 'matter', 'relevant', 'impact',
+        
         # Chinese
         '还有', '更多', '另外', '其他', '也', '还', '进一步', 
         '他们', '它们', '那个', '这个', '那些', '这些', '解释', 
         '详述', '详细', '为什么', '怎样', '关于', '那么', '然后', 
         '此外', '另外呢', '那', '所以', '但是', '和', '以及', '而且',
-        '如果', '要是', '既然', '既然如此'
+        '如果', '要是', '既然', '既然如此', '重要', '意义',
+        
+        # Spanish
+        'por qué', 'cómo', 'qué tal', 'explica', 'detalla', 'importante',
+        'también', 'además', 'otro', 'otra', 'más', 'eso', 'esto',
+        
+        # French  
+        'pourquoi', 'comment', 'expliquer', 'détailler', 'important',
+        'aussi', 'en plus', 'autre', 'plus', 'cela', 'ceci'
     ]
     
-    is_follow_up = any(indicator in query.lower() for indicator in follow_up_indicators)
+    # Short questions that are likely follow-ups
+    short_follow_up_patterns = [
+        'why?', 'how?', 'what?', 'where?', 'when?', 'who?',
+        'why is it important?', 'how so?', 'what do you mean?',
+        'can you explain?', 'tell me more', 'go on',
+        '为什么?', '怎么?', '什么?', '重要吗?',  # Chinese
+        '¿por qué?', '¿cómo?', '¿qué?',  # Spanish
+        'pourquoi?', 'comment?', 'quoi?'  # French
+    ]
     
+    query_lower = query.lower().strip()
+    
+    # Check for short follow-up patterns first (higher confidence)
+    for pattern in short_follow_up_patterns:
+        if query_lower == pattern.lower() or query_lower.startswith(pattern.lower()):
+            return {
+                "is_follow_up": True,
+                "confidence": 0.9,
+                "reason": "short_follow_up_pattern",
+                "pattern": pattern
+            }
+    
+    # Check for general follow-up indicators
+    matches = [indicator for indicator in follow_up_indicators if indicator in query_lower]
+    
+    if matches:
+        # Higher confidence if multiple indicators or if query is short
+        confidence = 0.8 if len(matches) > 1 or len(query.split()) <= 5 else 0.6
+        return {
+            "is_follow_up": True,
+            "confidence": confidence,
+            "reason": "heuristic_indicators",
+            "matched_indicators": matches
+        }
+    
+    # No indicators found
     return {
-        "is_follow_up": is_follow_up,
-        "confidence": 0.6 if is_follow_up else 0.4,
-        "reason": "heuristic_fallback"
+        "is_follow_up": False,
+        "confidence": 0.7,
+        "reason": "no_follow_up_indicators"
     }
 
 async def topic_moderation(
